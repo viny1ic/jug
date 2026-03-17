@@ -1,307 +1,257 @@
-# jug
-# A Minimal Prompt-Only Claude Code Skill Runner Using GitHub Copilot CLI
+# VS Code Extension Plan for Running Claude Code SKILL.md via Non‑Agentic Copilot‑Like Prompts
 
 ## Executive summary
 
-It is feasible to build a very small, CLI-first “skill runner” that executes a **Claude Code** `SKILL.md` end-to-end by implementing your own **agent loop** and using **GitHub Copilot CLI** only for **prompt-mode** reasoning (no Copilot agent mode/autopilot). The runner loads and renders a skill, reads target files, asks Copilot CLI (via repeated `-p/--prompt` calls) to plan and produce patches as **strict JSON actions**, applies the resulting unified diff locally, runs a validation command (tests/build), and asks Copilot CLI for a final report. This design stays robust because it does not depend on Copilot’s internal tool execution; instead, it uses a narrow, deterministic local tool surface and enforces an allowlist. citeturn3view1turn3view0turn4view1
+You can build a VS Code extension that executes Claude Code `SKILL.md` files end-to-end (read context → propose edits → apply changes → run tests/build → report) **without using Copilot CLI** by implementing your own deterministic “agent loop” inside the extension and calling Copilot-backed models through VS Code’s **Language Model API** (`vscode.lm.selectChatModels` + `model.sendRequest`). This is explicitly supported: VS Code documents how extensions can select Copilot models, send requests, handle user-consent, and process streaming responses. citeturn8view0turn8view3turn3view0
 
-To maximize “Claude-like” compatibility, the runner should support the Claude Code skill fields that directly affect execution semantics—especially **`allowed-tools`**, **argument substitution** (`$ARGUMENTS`, `$0`…), and **dynamic context injection** (`!`command`). Claude Code explicitly treats `!`command as **preprocessing** that runs before the model sees the prompt, which maps naturally to a local runner that executes commands and injects their outputs. citeturn4view1turn4view4
+Because many organizations disable “agent mode” (`chat.agent.enabled`) centrally, your design should **not depend on VS Code’s built-in agent loop**. Enterprise docs confirm that when agents are disabled, developers can still use **Ask/Edit** for chat and file edits, but autonomous task execution is unavailable. Your extension sidesteps that limitation by keeping the autonomy in your extension’s state machine while using the LM API as a non-agentic reasoning engine that emits strict JSON actions. citeturn2view0
 
-The prototype below demonstrates the smallest viable loop: **parse `SKILL.md` → plan → request file read → generate unified diff → apply diff → run tests/build → review → final report**, using Copilot CLI prompt mode with `-s` (script-friendly output) and tool-deny flags to keep the model in “prompt-only” behavior. citeturn3view1turn5view3turn5view0
+The critical engineering work is: (1) robust skill loading + rendering (Claude substitutions + `!`command preprocessing), (2) a strict JSON action protocol, (3) safe edit application using `WorkspaceEdit` + `workspace.applyEdit`, (4) controlled command execution via VS Code Task/Terminal APIs with explicit user confirmations, and (5) enterprise‑friendly deployment (workspace trust gating, allowlisted extension distribution, telemetry opt-outs). citeturn7view0turn5view3turn14view1turn14view2turn15view2turn9view1turn13view0
 
-## Minimal Claude SKILL.md inventory and execution stages for a lightweight runner
+## Goals and scope
 
-### Fields and semantics to support
+### Goals
 
-Claude Code documents the following frontmatter fields as relevant configuration knobs for skill behavior (a lightweight runner should support at least the “execution-affecting” ones): **`name`**, **`description`**, **`argument-hint`**, **`disable-model-invocation`**, **`user-invocable`**, **`allowed-tools`**, **`model`**, **`context`** (including `fork`), **`agent`** (subagent type when forked), and **`hooks`** (skill-scoped lifecycle hooks). citeturn4view1
+- Execute a Claude Code skill (`.claude/skills/<skill>/SKILL.md`) in a repeatable loop:
+  - gather context (read files, optional preprocessing)
+  - plan steps
+  - propose code edits (as unified diff or structured edits)
+  - apply edits to workspace
+  - run a test/build command
+  - produce a final summary report (and persist session artifacts). citeturn7view0turn15view2turn14view2turn14view1
+- Use “Copilot-like prompt calls” in a **non-agentic** way: call the LM API and require **JSON-only** outputs; do not rely on agent mode or Copilot CLI. citeturn8view0turn2view0
+- Be enterprise-safe by design: workspace trust gating, explicit approvals for risky operations, sensitive-file protection patterns, and opt-in telemetry. citeturn5view3turn9view3turn13view1
 
-For a minimal runner, treat these as follows:
+### Explicit non-goals for v1
 
-- **Must support (for good parity):** `name`, `description`, `allowed-tools`, and argument substitution (below). citeturn4view1turn4view4  
-- **Nice-to-have:** `model` (map to Copilot `--model`), `context: fork` (approximate by dropping conversational history), and `hooks` (approximate with runner lifecycle hooks). citeturn4view1turn5view2turn5view4  
-- **Mostly UI/selection hints:** `argument-hint`, `disable-model-invocation`, `user-invocable` (still useful for listing/auto-selection). citeturn4view1turn3view2
+- Full parity with Claude Code subagents (`context: fork`) and hooks semantics; you can approximate fork by isolating history in your own session store, but you won’t replicate Claude’s exact runtime. citeturn7view0turn2view0
+- Implementing VS Code “agent tools” / tool-calling integration. Enterprise policy can disable extension-contributed chat tools; we’ll keep your runner independent and triggered via commands. citeturn2view0turn0search4
 
-### String substitution and preprocessing stages
+### Key assumptions (state explicitly in docs/README)
 
-Claude Code skill text supports well-defined substitutions:
+- Users have Copilot access in VS Code and will grant the consent dialog when the extension requests model access; VS Code notes Copilot models require consent and that `selectChatModels` should be called from a user-initiated action (command). citeturn8view0turn0search1
+- Workspace is trusted for operations that execute code (tasks/terminal). If untrusted, extension runs in restricted mode and must disable trust-sensitive features; VS Code provides static manifest declarations and runtime APIs for this. citeturn5view3turn0search2
 
-- `$ARGUMENTS` (and if absent, Claude Code appends `ARGUMENTS: <value>`), plus `$ARGUMENTS[N]` and `$N` shorthand (`$0`, `$1`, …). citeturn4view2turn4view4  
-- `${CLAUDE_SESSION_ID}` and `${CLAUDE_SKILL_DIR}` for session correlation and stable references to skill-bundled resources. citeturn4view4  
-- Dynamic injection: `!`command syntax runs shell commands **before** skill content is sent to the model; output replaces the placeholder (explicitly **preprocessing**, not a tool the model runs). citeturn4view1  
+## Required VS Code APIs and enterprise constraints
 
-### Minimal execution stages for a prompt-only runner
+### Language Model API access (core dependency)
 
-A lightweight runner can mimic Claude Code’s skill execution stages as:
+- Select models via `vscode.lm.selectChatModels({ vendor: 'copilot', family: 'gpt-4o' })` and handle “no models available” (empty array). citeturn8view0turn3view2
+- Call the model via `model.sendRequest(messages, {}, token)` and consume the streaming response (`for await (const fragment of chatResponse.text)`). citeturn3view0turn8view0
+- Handle failures using `LanguageModelError` and anticipate user-consent and quota errors. citeturn8view0
+- Rate limiting: VS Code cautions that extensions should be aware of rate limits and should not use the LM API for integration tests. citeturn1view0
 
-1. **Discovery & load**: find `.claude/skills/<name>/SKILL.md` (and optionally `.github/skills`) and load YAML frontmatter + markdown body. Claude Code also treats `.claude/commands/*.md` and `.claude/skills/<name>/SKILL.md` as equivalent slash commands, so a runner can optionally support both for compatibility. citeturn3view3turn3view2  
-2. **Render**: apply `$ARGUMENTS` / `$N` / `${CLAUDE_*}` substitutions; append `ARGUMENTS:` if needed. citeturn4view2turn4view4  
-3. **Preprocess injections**: execute `!`command locally and insert output into rendered prompt. citeturn4view1  
-4. **Plan**: prompt Copilot CLI (programmatic prompt mode) to output a step plan in strict JSON. Copilot CLI explicitly supports programmatic prompting via `-p` and script-friendly output via `-s`. citeturn3view1turn3view0  
-5. **Execute**: loop tool calls and patches; run local tools (read file, apply patch, run tests). (In this design, you deny Copilot CLI tools and implement tools yourself.) Copilot CLI supports explicit tool allow/deny patterns; denying tools is a first-class feature. citeturn5view3turn5view4turn3view1  
-6. **Review & finalize**: ask Copilot CLI to review diff + test output and emit a final user-facing summary in JSON.
+### Workspace trust and restricted mode (security gate)
 
-## Feasibility mapping for prompt-only Copilot CLI orchestration
+- Add `capabilities.untrustedWorkspaces` to `package.json` with `supported: 'limited'` (recommended) so the extension can run “read-only / list skills” in restricted mode but disables command execution and writes until trusted. citeturn5view3
+- Gate at runtime using `vscode.workspace.isTrusted` and `onDidGrantWorkspaceTrust`. citeturn5view3
 
-The table below marks whether each Claude skill capability is feasible when Copilot is used only in `-p` prompt mode and the runner owns all side effects.
+### File I/O and edits in workspace
 
-| Claude skill capability | Feasible? | Rationale (prompt-only Copilot CLI + local runner) |
-|---|---:|---|
-| Parse `SKILL.md` (frontmatter + body) | Feasible | Runner parses locally; Copilot CLI is only for reasoning. Claude and Copilot both treat `SKILL.md` as markdown with YAML frontmatter. citeturn4view1turn3view2 |
-| Skill locations: `.claude/skills` and `~/.claude/skills` | Feasible | Copilot docs explicitly recognize `.claude/skills` / `~/.claude/skills` as valid skill locations (Claude-compatible), alongside `.github/skills`. citeturn3view2 |
-| Argument substitution (`$ARGUMENTS`, `$0`, etc.) | Feasible | Precisely specified by Claude Code docs; implement a deterministic renderer. citeturn4view2turn4view4 |
-| `${CLAUDE_SESSION_ID}`, `${CLAUDE_SKILL_DIR}` | Feasible | Specify and inject locally; these are explicitly documented substitutions. citeturn4view4 |
-| `!`command injections (dynamic context) | Feasible | Claude Code defines this as preprocessing before model sees prompt; runner can replicate exactly by executing shell and substituting output. citeturn4view1 |
-| Supporting files/resources in skill directory | Feasible | Runner can expose a `read_file` tool and feed contents back via prompts; Copilot skill docs also allow bundling scripts/resources referenced by instructions. citeturn3view2turn4view1 |
-| `allowed-tools` gating | Feasible | Treat as an allowlist for runner tools; Claude defines field purpose; runner can enforce it strongly. citeturn4view1 |
-| `model` override | Partial | Copilot CLI supports `--model`; mapping Claude model names to Copilot models is runner-specific and may not be 1:1. citeturn5view2turn5view4 |
-| `context: fork` + `agent` | Partial | You can approximate fork by running with no prior conversation history and a separate state file; you cannot replicate Claude subagent internals exactly. citeturn4view1 |
-| `hooks` in skill frontmatter | Partial | Runner can implement its own lifecycle hooks; Claude’s hook system is richer and tool-integrated. Copilot CLI also has a hooks concept, but the runner need not depend on it for a minimal prototype. citeturn4view1turn3view1 |
-| Full Claude Code tool semantics | Infeasible (exactly) | You can emulate behavior (read, diff, patch, run tests) but not reproduce Claude’s internal tool runtime identically. citeturn4view1 |
+- Reading files: use `workspace.fs`-based reads (or `TextDocument` APIs), and treat file access as workspace-scoped. The API reference explicitly distinguishes `workspace.fs` from `workspace.applyEdit`; prefer `applyEdit` for tracked, user-visible edits. citeturn14view0turn14view2
+- Applying edits: convert model output to a `WorkspaceEdit` and call `workspace.applyEdit(edit)`. citeturn14view1turn14view2
+- Use an `OutputChannel` for human-readable logs; VS Code provides `OutputChannel` as a read-only textual container for extension output. citeturn14view5
 
-## Minimal JSON action protocol for model → runner messages
+### Command execution
 
-The runner should require **JSON-only** output from Copilot CLI prompts. Two practical reasons:
+- Use VS Code Tasks for deterministic build/test execution: `tasks.executeTask(task)` returns a `TaskExecution`, and task lifecycle events exist (start/end and process start/end). citeturn15view2turn15view1
+- Alternatively, use an integrated terminal (`window.createTerminal`) for interactive visibility, but Tasks are better for capturing lifecycle and exit codes cleanly in enterprise environments. citeturn14view3turn15view2
 
-- Copilot CLI supports `-s` for scripting output (reduces extra text) and `--output-format=json` for JSONL logs, but the simplest reliable path is still “model prints one JSON object.” citeturn3view1turn5view0turn3view0  
-- Strict protocol enables deterministic retries and safe execution boundaries.
+### Enterprise policies and Copilot availability
 
-### Schema (informal but implementable)
+- Agent mode can be centrally disabled via policy (`ChatAgentMode`), corresponding to `chat.agent.enabled`; even then, developers can still use Ask/Edit. This supports your approach: implement your own loop instead of relying on built-in agent mode. citeturn2view0
+- Enterprise can control tool approvals and terminal auto-approval for agent tools. Even though your extension is not “agent tools,” these settings reflect enterprise expectations: you should implement your own confirmation prompts for risky operations (file edits, terminal commands). citeturn2view0turn9view3
+- Model availability is governed by plan, client, and organization restrictions; your extension must degrade gracefully if certain families/models are disabled. citeturn11view0turn10view0
 
-All messages include:
-- `type`: one of `plan | tool_call | apply_patch | run_cmd | review | final | fail`
-- `session_id`: string
+## Architecture and file conventions
 
-**Plan**
+### File/folder conventions and manifest
+
+Re-use Claude Code’s published skill conventions:
+
+- `.claude/skills/<skill-name>/SKILL.md` is the canonical entry point; `name` defaults to directory name; substitutions, `allowed-tools`, and `!`command preprocessing are defined in the Claude skill doc. citeturn7view0
+- Optional runner sidecar: `.claude/skills/<skill-name>/.copi-runner.json` (extension-specific settings like default test command, denylist patterns, max bytes). (Assumption: this is your extension’s convention, not a Claude standard.)
+
+Recommended layout:
+
+| Path | Purpose | Required |
+|---|---|---|
+| `.claude/skills/<skill>/SKILL.md` | Skill definition (frontmatter + instructions) | Yes citeturn7view0 |
+| `.claude/skills/<skill>/.copi-runner.json` | Runner knobs (test command, safety rules) | No |
+| `.copi-runner/sessions/<id>.json` | Session trace (plan/actions/diffs/results) | No |
+
+### Components (modules) and responsibilities
+
+**SkillLoader**
+- Discover skills under `.claude/skills/**/SKILL.md` in the opened workspace (use `workspace.findFiles`).
+- Parse YAML frontmatter + markdown body (recommend a small YAML parser dependency).
+- Build a “skills index” with name/description for QuickPick.
+
+**SkillRenderer**
+- Implements Claude substitutions exactly:
+  - `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N`
+  - `${CLAUDE_SESSION_ID}`, `${CLAUDE_SKILL_DIR}`
+  - “Append `ARGUMENTS:` if `$ARGUMENTS` not present.” citeturn7view0
+
+**Preprocessor**
+- Implements `!`command preprocessing:
+  - Execute commands before sending prompt; replace placeholder with output.
+  - Claude docs emphasize this is preprocessing (model sees only rendered output). citeturn7view0
+- Security: require explicit confirmation (and disable in untrusted workspaces).
+
+**Prompt modules**
+- Planner → Executor → Reviewer → Final Reporter templates, each producing **JSON-only** responses.
+
+**ToolRunner**
+- Implements runner tools corresponding to your JSON protocol:
+  - `read_file`: `workspace.fs.readFile`
+  - `apply_patch`: parse unified diff → `WorkspaceEdit` → `workspace.applyEdit`
+  - `run_cmd`: execute a VS Code Task; capture exit code via task process end events. citeturn14view0turn14view2turn15view2
+
+**SessionStore**
+- Persist:
+  - prompts sent (redacted)
+  - tool results
+  - diffs/edits applied
+  - command outputs
+  - final report
+- Storage options:
+  - workspace-local `.copi-runner/sessions` for shareable traces
+  - extension `globalStorageUri` / `storageUri` for private traces (API reference notes storage URIs exist and can be used with `workspace.fs`). citeturn14view0
+
+**UI and Commands**
+- Command palette commands:
+  - `copiRunner.runSkill`
+  - `copiRunner.listSkills`
+  - `copiRunner.openLastSessionLog`
+  - `copiRunner.cancelRun`
+- Output channel: `Copi Runner` for step-by-step log.
+- Optional: Chat participant integration (later). VS Code documents that for advanced scenarios you can implement tool calling yourself and suggests using prompt-tsx if desired. citeturn13view2turn1view0
+
+## Prompt flow, JSON protocol, templates, and runtime flow
+
+### Message protocol (JSON action schema)
+
+All messages must be **one JSON object** (no markdown). Types:
+
+- `plan`
+- `tool_call`
+- `apply_patch`
+- `run_cmd`
+- `review`
+- `final`
+- `fail` (recommended for explicit aborts)
+
+Suggested minimal schema:
+
 ```json
 {
+  "type": "tool_call",
+  "session_id": "string",
+  "tool": "read_file | apply_patch | run_cmd",
+  "args": { }
+}
+```
+
+Additional fields by type:
+
+- `plan`: `steps[]` with `id`, `goal`, `success_criteria[]`
+- `apply_patch`: `diff` (unified diff), `files_touched[]`
+- `run_cmd`: `command`, `cwd`, `timeout_sec`
+- `review`: `verdict` (`pass|retry|fail`), `issues[]`
+- `final`: `summary`, `diff_excerpt`, `command_result_excerpt`
+
+### Mermaid runtime flowchart
+
+```mermaid
+flowchart TD
+  A[User command: Run Skill] --> B[Workspace trust check + policy load]
+  B --> C[Load SKILL.md + sidecar]
+  C --> D[Render substitutions + !`cmd` preprocessing]
+  D --> E[Select LM model via vscode.lm.selectChatModels]
+  E --> F[Planner prompt -> plan JSON]
+  F --> G[Executor prompt -> tool_call JSON]
+  G --> H[ToolRunner executes tool; append tool result]
+  H --> I{Next action?}
+  I -->|apply_patch| J[Apply patch via WorkspaceEdit + workspace.applyEdit]
+  I -->|run_cmd| K[Run task; capture exit code/output]
+  I -->|review| L[Reviewer prompt -> verdict JSON]
+  L -->|retry (<=N)| G
+  L -->|pass| M[Final prompt -> final JSON]
+  M --> N[Persist session + show summary + open diffs]
+```
+
+### Prompt templates (JSON-only)
+
+These templates should be built as `LanguageModelChatMessage.User(...)` messages. VS Code docs show using “persona/rules” as the first message and the actionable task as the second, and that `LanguageModelChatMessage.User/Assistant` exist. citeturn8view2turn8view0turn3view0
+
+**Planner**
+```text
+Return ONE valid JSON object only. No markdown. No extra text.
+
+You are planning execution of a Claude Code SKILL.md using a VS Code extension runner.
+You have NO direct tool access. The runner will execute file reads, edits, and commands as instructed.
+
+Rendered skill instructions:
+<<<
+{RENDERED_SKILL}
+>>>
+
+Output schema:
+{
   "type": "plan",
-  "session_id": "…",
+  "session_id": "{SESSION_ID}",
   "steps": [
-    {"id":"step-1","goal":"…","success_criteria":["…"],"allowed_runner_tools":["read_file","apply_patch","run_cmd"]}
+    {
+      "id": "step-1",
+      "goal": "...",
+      "success_criteria": ["..."],
+      "allowed_runner_tools": ["read_file","apply_patch","run_cmd"]
+    }
   ]
 }
 ```
 
-**Tool call**
-```json
-{
-  "type": "tool_call",
-  "session_id": "…",
-  "tool": "read_file | grep | glob",
-  "args": { "path": "…" },
-  "rationale": "…"
-}
-```
-
-**Apply patch**
-```json
-{
-  "type": "apply_patch",
-  "session_id": "…",
-  "diff": "UNIFIED_DIFF",
-  "files_touched": ["path1", "path2"],
-  "rationale": "…"
-}
-```
-
-**Run command**
-```json
-{
-  "type": "run_cmd",
-  "session_id": "…",
-  "command": "pytest -q",
-  "cwd": ".",
-  "timeout_sec": 600,
-  "rationale": "…"
-}
-```
-
-**Review**
-```json
-{
-  "type": "review",
-  "session_id": "…",
-  "verdict": "pass | retry | fail",
-  "issues": [{"severity":"high|med|low","detail":"…"}],
-  "next_action": "…"
-}
-```
-
-**Final**
-```json
-{
-  "type": "final",
-  "session_id": "…",
-  "summary": "…",
-  "diff": "…",
-  "test_output_excerpt": "…"
-}
-```
-
-## File and folder conventions
-
-The runner should be **Claude-compatible by default**:
-
-- Primary location: `.claude/skills/<name>/SKILL.md`  
-- Optional compatibility: `.github/skills/<name>/SKILL.md`  
-Copilot’s docs explicitly list both `.claude/skills` and `.github/skills` as valid project skill locations, and both `~/.claude/skills` and `~/.copilot/skills` as valid personal locations. citeturn3view2
-
-### Minimal layout table
-
-| Path | Purpose | Required |
-|---|---|---|
-| `.claude/skills/<skill>/SKILL.md` | Claude skill entrypoint (frontmatter + instructions) | Yes |
-| `.claude/skills/<skill>/.copi-runner.json` | Optional runner sidecar (policy + default test command) | No |
-| `.copi-runner/sessions/<session_id>.json` | Runner session persistence (plan, tool outputs, diffs) | No |
-
-## Runtime loop design
-
-### Mermaid flowchart
-
-```mermaid
-flowchart TD
-  A[Load SKILL.md + sidecar] --> B[Render substitutions + preprocess !`cmd`]
-  B --> C[Copilot prompt: planner -> JSON plan]
-  C --> D[Copilot prompt: executor -> tool_call(read_file)]
-  D --> E[Runner reads file, stores tool result]
-  E --> F[Copilot prompt: executor -> apply_patch diff]
-  F --> G[Runner applies diff safely]
-  G --> H[Runner runs test/build command]
-  H --> I[Copilot prompt: reviewer -> verdict]
-  I -->|retry| F
-  I -->|pass| J[Copilot prompt: final -> summary JSON]
-  J --> K[Print results, persist session, exit]
-```
-
-### Concise pseudocode
-
-```text
-load_skill(skill_name)
-rendered = render_args_and_vars(skill_text, args, session_id, skill_dir)
-rendered = preprocess_bang_commands(rendered)  # !`cmd` injection
-
-plan = copilot_prompt(PLANNER(rendered, policy))
-
-# minimal loop
-tool_req = copilot_prompt(EXEC_TOOLCALL(rendered, plan))
-assert tool_req.tool == "read_file"
-file_text = read_file(tool_req.args.path)
-
-patch = copilot_prompt(EXEC_PATCH(rendered, plan, file_text))
-apply_unified_diff(patch.diff)   # git apply or patch
-
-test_cmd = sidecar.test_cmd or autodetect(pytest vs compileall)
-test_out = run(test_cmd)
-
-review = copilot_prompt(REVIEW(rendered, patch.diff, test_out))
-if review.verdict == "retry": go back to EXEC_PATCH (bounded)
-
-final = copilot_prompt(FINAL(rendered, patch.diff, test_out))
-print(final.summary)
-```
-
-## Prompt templates optimized for Copilot CLI prompt mode
-
-These templates are designed to work with `copilot -p` programmatic prompting and `-s` scripting output. citeturn3view1turn3view0
-
-### Planner prompt
-
-```text
-Return ONE valid JSON object only. No markdown. No prose outside JSON.
-
-You are planning execution of a Claude Code SKILL.md using a local runner.
-You have NO tool access. You must produce a plan only.
-
-Rendered skill instructions:
-<<<
-{RENDERED_SKILL}
->>>
-
-Policy:
-- Runner will perform file edits and command execution.
-- Always assume later steps will supply file contents and command outputs.
-
-Output schema:
-{
-  "type": "plan",
-  "session_id": "{SESSION_ID}",
-  "steps": [{"id":"step-1","goal":"...","success_criteria":["..."],"allowed_runner_tools":["read_file","apply_patch","run_cmd"]}]
-}
-```
-
-### Executor prompt (tool_call)
-
+**Executor (choose next action)**
 ```text
 Return ONE valid JSON object only.
 
-Task: request the minimum input needed to proceed.
-Choose exactly ONE tool_call.
+Context:
+- session_id: {SESSION_ID}
+- step: {CURRENT_STEP}
+- recent_tool_results: {TOOL_RESULTS_SUMMARY}
+- current_workspace_diff: {DIFF_SUMMARY}
 
-Rendered skill instructions:
-<<<
-{RENDERED_SKILL}
->>>
+Choose exactly one action:
+- tool_call(read_file)
+- apply_patch(unified diff)
+- run_cmd
+- review
+- fail
 
-Invocation args:
-{ARGS_JSON}
-
-Output schema:
-{
-  "type": "tool_call",
-  "session_id": "{SESSION_ID}",
-  "tool": "read_file",
-  "args": {"path": "{TARGET_PATH}"},
-  "rationale": "short"
-}
+Output one of the schemas:
+{...}
 ```
 
-### Executor prompt (apply_patch)
-
+**Reviewer**
 ```text
 Return ONE valid JSON object only.
 
-You must produce a minimal unified diff that implements the skill.
-Do not invent file contents beyond what is provided.
-
-Rendered skill instructions:
-<<<
-{RENDERED_SKILL}
->>>
-
-File content:
-<<<FILE {TARGET_PATH}
-{FILE_TEXT}
-FILE>>>
-
-Output schema:
-{
-  "type": "apply_patch",
-  "session_id": "{SESSION_ID}",
-  "diff": "UNIFIED_DIFF",
-  "files_touched": ["{TARGET_PATH}"],
-  "rationale": "short"
-}
-```
-
-### Reviewer prompt
-
-```text
-Return ONE valid JSON object only.
-
-Review the diff and test output. Be strict.
-If tests failed, verdict must be "retry" or "fail".
+Evaluate whether the changes satisfy the skill instructions and step success criteria.
 
 Diff:
 <<<DIFF
-{DIFF}
+{UNIFIED_DIFF}
 DIFF>>>
 
-Test output:
-<<<TEST
-{TEST_OUTPUT}
-TEST>>>
+Command result:
+<<<CMD
+exit_code={EXIT}
+stdout/stderr:
+{OUTPUT}
+CMD>>>
 
-Output schema:
+Schema:
 {
   "type": "review",
   "session_id": "{SESSION_ID}",
@@ -311,365 +261,209 @@ Output schema:
 }
 ```
 
-### Final reporter prompt
-
+**Final**
 ```text
 Return ONE valid JSON object only.
 
-Write a concise final summary for the user describing:
+Write a concise final report for the user:
 - what changed
-- whether tests/build passed
+- what command ran and whether it passed
 - any follow-ups
 
-Diff:
-<<<DIFF
-{DIFF}
-DIFF>>>
-
-Test output:
-<<<TEST
-{TEST_OUTPUT}
-TEST>>>
-
-Output schema:
+Schema:
 {
   "type": "final",
   "session_id": "{SESSION_ID}",
   "summary": "string",
-  "diff": "string",
-  "test_output_excerpt": "string"
+  "diff_excerpt": "string",
+  "command_result_excerpt": "string"
 }
 ```
 
-## Copilot CLI command patterns and safe shell snippets
+## Error handling, retries, and security model
 
-Copilot CLI supports programmatic execution using `-p/--prompt` and recommends `-s/--silent` for scripting output. citeturn3view1turn3view0  
-It also supports strong tool permission gating via `--deny-tool` (and allow patterns via `--allow-tool`). citeturn5view3turn5view4
+### Error handling and retries
 
-### Recommended safe patterns (prompt-only)
+- Model selection:
+  - Handle empty model array and show a user-friendly message (“Copilot Chat extension not installed/enabled” is explicitly shown in the official sample). citeturn3view2turn8view0
+- Model request failures:
+  - Catch `LanguageModelError` and branch:
+    - missing consent
+    - quota exceeded / rate limited
+    - “off topic” or policy constraints (VS Code guide mentions using `LanguageModelError` and checking `err.code`/`err.cause`). citeturn8view0
+- JSON parsing failures:
+  - Implement a “repair” prompt: feed the raw text back and demand JSON-only.
+  - Bound it (e.g., 2 repair attempts), then fail with diagnostics.
+- Task execution:
+  - Use task lifecycle events (`onDidEndTaskProcess`) to capture exit code and stop the loop if nonzero unless the reviewer explicitly requests retry. citeturn15view2
 
-**Snippet A: Basic prompt-only JSON call**
-```bash
-copilot -p "$PROMPT" -s --no-ask-user \
-  --deny-tool='shell,write,read,url,memory'
-```
-`--no-ask-user` disables the `ask_user` tool (prevents the agent from pausing for questions). citeturn5view2
+### Security model (enterprise-ready)
 
-**Snippet B: Multiline prompt via heredoc (safe quoting)**
-```bash
-PROMPT="$(cat <<'EOF'
-Return ONE JSON object only.
-{"type":"ping","session_id":"demo","msg":"hello"}
-EOF
-)"
-copilot -p "$PROMPT" -s --no-ask-user --deny-tool='shell,write,read,url,memory'
-```
-Copilot’s docs show `copilot -p ... -s` as the canonical programmatic/scripting combination. citeturn3view0turn3view1
+**Workspace Trust (hard gate)**
+- In `package.json`, set `capabilities.untrustedWorkspaces.supported: 'limited'` and disable write/run actions until trusted. VS Code provides both static declarations and the runtime `workspace.isTrusted` gate and UI recommendations (hide commands using `when` with `isWorkspaceTrusted`). citeturn5view3
 
-**Snippet C: Capture output robustly**
-```bash
-OUT="$(copilot -p "$PROMPT" -s --no-ask-user --deny-tool='shell,write,read,url,memory')"
-echo "$OUT" | jq .
-```
+**User confirmations**
+- VS Code’s chat participant guide explicitly recommends asking for user consent before costly operations or edits that cannot be undone, as a UX/security guideline for AI features. citeturn13view2
+- Implement confirmations for:
+  - `!`command preprocessing execution
+  - apply_patch crossing sensitive files
+  - run_cmd execution.
 
-**Snippet D: Emit JSONL for logs (optional)**
-```bash
-copilot -p "$PROMPT" -s --output-format=json \
-  --no-custom-instructions --deny-tool='shell,write,read,url,memory'
-```
-`--output-format=json` outputs JSONL (“one JSON object per line”) and `--no-custom-instructions` disables loading instructions from `AGENTS.md` and related files (useful for reproducibility). citeturn5view0turn5view1
+**Allowlists and sandboxing**
+- Tool allowlist derived from Claude `allowed-tools` field (even if downstream systems sometimes don’t enforce it perfectly, your runner can). Claude docs define `allowed-tools` as the tools Claude can use without asking permission when the skill is active; in your extension, treat it as the set of runner tools permitted by the skill. citeturn7view0
+- Sensitive file protection:
+  - Adopt the same concept as VS Code’s security guidance: protect sensitive files with glob patterns and require manual approval (the Copilot security doc gives an explicit example pattern for `.env`). citeturn9view3
+- Patch path safety:
+  - Reject diffs that reference paths outside workspace.
+  - Only allow writes within `workspace.workspaceFolders`.
 
-## Minimal runnable prototype script (≤200 LOC)
+**Enterprise policy awareness**
+- Agents can be disabled by policy; VS Code confirms Ask/Edit still work. Your extension should be resilient to this by not relying on agent mode at all. citeturn2view0
+- Extension-contributed tools can be disabled by enterprise policy; avoid depending on “chat tool” contribution points for core behavior. citeturn2view0
 
-This script is intentionally small and conservative. It:
+## Testing strategy and Spec Kit integration
 
-- loads `.claude/skills/<skill>/SKILL.md`  
-- renders `$ARGUMENTS` and `$0` (minimal subset)  
-- runs 4 Copilot CLI prompt calls (plan → tool_call/read_file → apply_patch → review → final)  
-- applies patch via `git apply` if available (fallback: `patch`)  
-- runs tests/build via sidecar config or simple autodetect  
-- persists a session JSON file locally  
+### Testing strategy
 
-It uses only Python standard library. It relies on Copilot CLI being installed/authenticated and uses prompt mode (`-p`) with `-s` and tool-deny flags. citeturn3view1turn5view3turn3view0
+**Unit tests (fast, deterministic)**
+- Skill parsing (frontmatter + body)
+- Substitution renderer: `$ARGUMENTS`, `$0`, `${CLAUDE_SKILL_DIR}`, etc. citeturn7view0
+- Diff parser → `WorkspaceEdit` mapping
+- Policy engine (workspace trust gating; sensitive-file patterns)
 
-```python
-#!/usr/bin/env python3
-import json, os, re, shutil, subprocess, sys, time
-from pathlib import Path
+**Integration tests (without calling real LMs)**
+- VS Code recommends not using the LM API in integration tests due to rate limits, and mentions internal simulation approaches. Practically, you should mock your “LLM client” interface and replay canned JSON actions. citeturn1view0turn8view0
 
-DENY = "shell,write,read,url,memory"
+**Manual test matrix**
+- Trusted vs untrusted workspace
+- Copilot available vs unavailable (models list empty)
+- Quota/rate limit simulation (force `LanguageModelError`)
+- Patch failure and retry behavior.
 
-def run(cmd, **kw):
-    return subprocess.run(cmd, text=True, capture_output=True, **kw)
+### Spec Kit integration
 
-def copilot(prompt, model=None):
-    cmd = ["copilot", "-s", "--no-ask-user", f"--deny-tool={DENY}", "-p", prompt]
-    if model: cmd += ["--model", model]
-    p = run(cmd)
-    if p.returncode != 0:
-        raise RuntimeError(f"copilot failed: {p.stderr.strip()}")
-    return p.stdout.strip()
+Use Spec Kit as the development methodology for this extension: capture compatibility requirements as specs and generate implementation tasks. GitHub positions Spec Kit as a spec-driven development toolkit for AI coding workflows. citeturn4search3turn4search0
 
-def parse_json(s):
-    s = s.strip()
-    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.M)
-    try: return json.loads(s)
-    except json.JSONDecodeError:
-        a, b = s.find("{"), s.rfind("}")
-        if a != -1 and b != -1 and b > a:
-            return json.loads(s[a:b+1])
-        raise
+Concrete integration pattern:
+- Add a `spec/` or `.speckit/` folder that contains:
+  - a “compatibility constitution” (security + UX principles)
+  - a “Skill Runner Spec” enumerating supported Claude frontmatter fields and runner tools
+  - acceptance fixtures (sample skills + expected session traces)
+- In the extension, add a dev-only command:
+  - `copiRunner.dumpSessionAsSpecArtifact` → writes session JSON + a short summary markdown to a `spec/artifacts/` folder.
 
-def load_skill(skill_name):
-    p = Path(".claude/skills")/skill_name/"SKILL.md"
-    if not p.exists():
-        raise FileNotFoundError(f"Missing {p}")
-    txt = p.read_text(encoding="utf-8")
-    fm, body = {}, txt
-    if txt.startswith("---"):
-        parts = txt.split("---", 2)
-        if len(parts) >= 3:
-            fm_txt, body = parts[1], parts[2].lstrip()
-            for line in fm_txt.splitlines():
-                if ":" in line:
-                    k,v = line.split(":",1)
-                    fm[k.strip()] = v.strip()
-    side = p.parent/".copi-runner.json"
-    sidecfg = {}
-    if side.exists():
-        sidecfg = json.loads(side.read_text(encoding="utf-8"))
-    return p, fm, body, sidecfg
+If you want to connect more directly, Spec Kit’s quickstart describes the workflow phases (constitution → spec → plan → tasks) and can be referenced in contributor docs. citeturn4search8turn4search0
 
-def render_skill(body, args, session_id, skill_dir):
-    rendered = body.replace("${CLAUDE_SESSION_ID}", session_id)\
-                   .replace("${CLAUDE_SKILL_DIR}", str(skill_dir))
-    rendered = rendered.replace("$ARGUMENTS", " ".join(args))
-    for i,a in enumerate(args):
-        rendered = rendered.replace(f"$ARGUMENTS[{i}]", a).replace(f"${i}", a)
-    if "$ARGUMENTS" not in body and args:
-        rendered += f"\n\nARGUMENTS: {' '.join(args)}\n"
-    return rendered
+## Telemetry, logging, session persistence, packaging, and enterprise deployment
 
-def safe_paths_from_diff(diff):
-    paths = []
-    for ln in diff.splitlines():
-        if ln.startswith("+++ ") or ln.startswith("--- "):
-            p = ln[4:].strip()
-            if p == "/dev/null": continue
-            p = re.sub(r"^[ab]/", "", p)
-            if p.startswith("/") or ".." in Path(p).parts:
-                raise ValueError(f"Unsafe path in diff: {p}")
-            paths.append(p)
-    return sorted(set(paths))
+### Logging + session persistence
 
-def apply_diff(diff):
-    safe_paths_from_diff(diff)
-    patchfile = Path(".copi-runner")/"tmp.patch"
-    patchfile.parent.mkdir(parents=True, exist_ok=True)
-    patchfile.write_text(diff, encoding="utf-8")
-    if shutil.which("git") and Path(".git").exists():
-        p = run(["git","apply","--whitespace=nowarn", str(patchfile)])
-        if p.returncode == 0: return "git apply"
-        raise RuntimeError(f"git apply failed:\n{p.stderr}")
-    if shutil.which("patch"):
-        p = run(["patch","-p1","--forward","--silent"], input=diff)
-        if p.returncode == 0: return "patch"
-        raise RuntimeError(f"patch failed:\n{p.stderr}")
-    raise RuntimeError("No git or patch available to apply unified diff")
+- Use an `OutputChannel` for human-readable logs and progress. citeturn14view5
+- Persist session traces:
+  - recommended: workspace-local `.copi-runner/sessions/<id>.json` (easy to share internally)
+  - optional: `globalStorageUri`/`storageUri` for private logs. citeturn14view0turn14view2
 
-def choose_test_cmd(sidecfg):
-    if isinstance(sidecfg, dict) and sidecfg.get("test_cmd"):
-        return sidecfg["test_cmd"]
-    if shutil.which("pytest"):
-        return "pytest -q"
-    return f"{shutil.which('python3') or 'python'} -m compileall ."
+### Telemetry (opt-in and enterprise-aware)
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: copi_runner.py <skill-name> <target-file> [args...]", file=sys.stderr)
-        return 2
-    skill_name, target = sys.argv[1], sys.argv[2]
-    args = sys.argv[2:]
-    session_id = f"s{int(time.time())}"
-    skill_path, fm, body, side = load_skill(skill_name)
-    rendered = render_skill(body, args, session_id, skill_path.parent)
+- VS Code provides a telemetry author guide and recommends `@vscode/extension-telemetry` for safe, consistent telemetry collection, and stresses respecting user settings (`telemetry.telemetryLevel`). citeturn13view0turn13view1
+- For enterprise, telemetry can be centrally managed via policy (`TelemetryLevel`). Your extension should either:
+  - use the official telemetry module (preferred), or
+  - fully respect `isTelemetryEnabled` / settings and provide an extension-level opt-in. citeturn13view0turn13view1
 
-    os.makedirs(".copi-runner/sessions", exist_ok=True)
-    sess_path = Path(".copi-runner/sessions")/f"{session_id}.json"
+### Packaging and distribution
 
-    planner = f"""Return ONE valid JSON object only.
-Rendered skill instructions:
-<<<
-{rendered}
->>>
-Output schema: {{"type":"plan","session_id":"{session_id}","steps":[{{"id":"step-1","goal":"...","success_criteria":["..."],"allowed_runner_tools":["read_file","apply_patch","run_cmd"]}}]}}"""
-    plan = parse_json(copilot(planner, model=side.get("model") if isinstance(side, dict) else None))
+- Package as `.vsix` using `vsce package`; users/admins can install via `code --install-extension <vsix>`. citeturn9view0
+- Enterprise controls:
+  - allowed extensions allowlist (`extensions.allowed`) can restrict installation; plan for an allowlisted publisher/extension ID. citeturn9view1
+  - private marketplace can host internal extensions and curated public ones; VS Code enterprise docs outline self-hosting and rollout. citeturn9view1
 
-    toolcall_prompt = f"""Return ONE valid JSON object only.
-Choose exactly ONE tool_call to read the target file.
-Schema: {{"type":"tool_call","session_id":"{session_id}","tool":"read_file","args":{{"path":"{target}"}}, "rationale":"short"}}"""
-    toolreq = parse_json(copilot(toolcall_prompt))
-    file_text = Path(toolreq["args"]["path"]).read_text(encoding="utf-8")
+### Milestones and effort estimate
 
-    exec_prompt = f"""Return ONE valid JSON object only.
-Produce a minimal unified diff implementing the skill.
-Rendered instructions:
-<<<
-{rendered}
->>>
-File content:
-<<<FILE {target}
-{file_text}
-FILE>>>
-Schema: {{"type":"apply_patch","session_id":"{session_id}","diff":"UNIFIED_DIFF","files_touched":["{target}"],"rationale":"short"}}"""
-    patch = parse_json(copilot(exec_prompt))
-    how = apply_diff(patch["diff"])
+Assuming one experienced extension engineer; estimates include tests and documentation.
 
-    test_cmd = choose_test_cmd(side if isinstance(side, dict) else {})
-    t = run(test_cmd, shell=True)
-    test_out = (t.stdout + "\n" + t.stderr).strip()[:8000]
+| Milestone | Deliverables | Est. hours |
+|---|---|---:|
+| Prototype loop | Command `Run Skill`, selects model, JSON-only planner/executor/reviewer/final, OutputChannel logs | 12–18 |
+| Skill compatibility core | `.claude/skills` discovery, frontmatter parse, substitutions, argument UI, `.copi-runner.json` parsing | 10–16 |
+| Safe patch application | Unified diff → WorkspaceEdit pipeline; sensitive file denylist; preview/confirm UI | 14–24 |
+| Command execution | Task-based runner + exit code capture; confirmation prompts; cancel support | 10–18 |
+| Enterprise hardening | Workspace Trust support (`capabilities.untrustedWorkspaces` + gating), policy-aware behavior, documentation | 10–16 citeturn5view3turn2view0turn9view1 |
+| Testing + spec-kit plumbing | Unit tests, fixture replay, spec artifacts, CI pipeline | 12–20 citeturn1view0turn4search3 |
+| Packaging + rollout | VSIX packaging, installation docs, internal deployment guidance | 6–10 citeturn9view0turn9view1 |
 
-    review_prompt = f"""Return ONE valid JSON object only.
-Diff:
-<<<DIFF
-{patch["diff"]}
-DIFF>>>
-Test output:
-<<<TEST
-{test_out}
-TEST>>>
-Schema: {{"type":"review","session_id":"{session_id}","verdict":"pass|retry|fail","issues":[{{"severity":"high|med|low","detail":"..."}}],"next_action":"short"}}"""
-    review = parse_json(copilot(review_prompt))
+Total (MVP usable): ~**56–92 hours**.
 
-    final_prompt = f"""Return ONE valid JSON object only.
-Write a concise final summary for the user.
-Applied via: {how}
-Test command: {test_cmd} (exit={t.returncode})
-Diff:
-<<<DIFF
-{patch["diff"]}
-DIFF>>>
-Test output:
-<<<TEST
-{test_out}
-TEST>>>
-Schema: {{"type":"final","session_id":"{session_id}","summary":"string","diff":"string","test_output_excerpt":"string"}}"""
-    final = parse_json(copilot(final_prompt))
+## Minimal code scaffold and a small TypeScript snippet (≤120 LOC)
 
-    sess_path.write_text(json.dumps({
-        "session_id": session_id,
-        "skill": skill_name,
-        "skill_path": str(skill_path),
-        "frontmatter": fm,
-        "plan": plan,
-        "tool_request": toolreq,
-        "apply_patch": {"how": how, "files": patch.get("files_touched", []), "diff": patch["diff"]},
-        "test": {"cmd": test_cmd, "exit": t.returncode, "output": test_out},
-        "review": review,
-        "final": final
-    }, indent=2), encoding="utf-8")
+### Scaffold outline (files and key functions)
 
-    print(final["summary"])
-    return 0 if review.get("verdict") == "pass" and t.returncode == 0 else 1
+- `src/extension.ts`
+  - activate: register commands
+  - create OutputChannel
+- `src/skills/discover.ts`
+  - `findSkills(): Promise<SkillRef[]>`
+- `src/skills/parse.ts`
+  - `parseSkill(uri): SkillDefinition`
+- `src/skills/render.ts`
+  - `renderSubstitutions(skill, args, sessionId): string`
+  - `preprocessBang(rendered): Promise<string>` (gated + confirmed)
+- `src/lm/client.ts`
+  - `selectModel(selector): Promise<LanguageModelChat>`
+  - `requestJson(messages): Promise<any>`
+- `src/runner/loop.ts`
+  - `runSkill(def, args): Promise<SessionResult>`
+  - state machine implementing plan/tool_call/apply_patch/run_cmd/review/final
+- `src/runner/tools.ts`
+  - `readFile(path)`
+  - `applyUnifiedDiff(diff)` → `WorkspaceEdit`
+  - `runTask(command)` → exitCode/output
+- `src/store/sessionStore.ts`
+  - `writeSession(session): Promise<void>`
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+### TypeScript snippet (≤120 LOC): call LM API and parse JSON
+
+This code follows the official model-selection + sendRequest pattern and captures a streaming response, similar to the VS Code samples and the LM API guide. citeturn8view0turn3view0turn3view2
+
+```ts
+import * as vscode from 'vscode';
+
+export async function requestJsonFromCopilot(prompt: string): Promise<any> {
+  // Must be called from a user-initiated command; Copilot models require consent.
+  // (VS Code will show an auth/consent dialog if needed.)
+  const [model] = await vscode.lm.selectChatModels({ vendor: 'copilot', family: 'gpt-4o' });
+  if (!model) {
+    throw new Error('No Copilot model available. Ensure Copilot Chat is installed and enabled.');
+  }
+
+  const messages = [
+    vscode.LanguageModelChatMessage.User(
+      'Return ONE valid JSON object only. No markdown. No extra text.'
+    ),
+    vscode.LanguageModelChatMessage.User(prompt),
+  ];
+
+  const tokenSource = new vscode.CancellationTokenSource();
+  const resp = await model.sendRequest(messages, {}, tokenSource.token);
+
+  let text = '';
+  for await (const fragment of resp.text) {
+    text += fragment;
+  }
+
+  // Robust JSON extraction (basic)
+  const trimmed = text.trim().replace(/^```json\s*|```$/g, '');
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const a = trimmed.indexOf('{');
+    const b = trimmed.lastIndexOf('}');
+    if (a >= 0 && b > a) return JSON.parse(trimmed.slice(a, b + 1));
+    throw new Error(`Model did not return JSON. Raw output: ${trimmed}`);
+  }
+}
 ```
 
-## Worked example: a tiny Claude skill + the prompt/command sequence
-
-### Example SKILL.md
-
-Create `.claude/skills/fix-add-bug/SKILL.md`:
-
-```markdown
----
-name: fix-add-bug
-description: Fix a simple logic bug in a Python function and ensure tests/build pass.
-allowed-tools: Read, Edit
-argument-hint: [file-path]
----
-
-Fix the bug in the Python file at $0.
-
-Rules:
-- Make the minimal change to correct behavior.
-- Do not refactor unrelated code.
-- After changes, ensure the project still builds/tests by running a lightweight command.
-
-Output:
-- A short summary of the bug and the fix.
-```
-
-This uses Claude’s documented `$0` positional argument convention. citeturn4view2turn4view4
-
-Create a buggy file `demo/math_utils.py`:
-
-```python
-def add(a, b):
-    return a - b  # BUG: should add
-```
-
-Optionally add `.claude/skills/fix-add-bug/.copi-runner.json`:
-
-```json
-{"test_cmd":"python -m compileall ."}
-```
-
-### What the script runs (conceptually)
-
-The script will execute this exact high-level sequence:
-
-1. **Planner (Copilot CLI prompt mode):** `copilot -p "<planner prompt>" -s --no-ask-user --deny-tool=...` citeturn3view1turn5view3  
-2. **Tool-call request:** prompt Copilot to output `{"type":"tool_call","tool":"read_file","args":{"path":"demo/math_utils.py"}}`  
-3. **Local file read:** runner reads file content  
-4. **Patch generation:** prompt Copilot to output `{"type":"apply_patch","diff":"..."}` (unified diff)  
-5. **Patch apply:** runner applies unified diff (via `git apply` or `patch`)  
-6. **Test/build command:** runner executes sidecar `test_cmd` (or autodetect)  
-7. **Review prompt:** Copilot reviews diff + test output and returns `pass|retry|fail` JSON  
-8. **Final prompt:** Copilot emits the final user-facing summary JSON
-
-This is aligned with Copilot’s official programmatic mode (`-p`) and scripting output (`-s`). citeturn3view1turn3view0
-
-## Minimal implementation plan, effort estimate, and key risks
-
-### Plan (smallest useful version)
-
-- Implement `SKILL.md` parsing + minimal frontmatter extraction
-- Implement Claude substitutions (`$ARGUMENTS`, `$0`, `${CLAUDE_*}`) and `ARGUMENTS:` append behavior (recommended for parity) citeturn4view2turn4view4  
-- Implement 4 prompt templates (plan/toolcall/patch/review/final)
-- Implement safe diff application (prefer `git apply`, fallback to `patch`) + path safety checks
-- Implement one validation command runner
-- Persist session JSON in `.copi-runner/sessions`
-
-### Effort estimate (prototype)
-
-- **4–8 hours**: working single-script prototype in Python (similar to above), including basic safety checks and JSON-parse heuristics.
-- **+6–12 hours**: broaden compatibility (more frontmatter fields, `!`command preprocessing, more tools like grep/glob, bounded retries).
-- **+1–2 days**: harden patch application, add robust tool allowlists, add a small fixture suite of “real” skills.
-
-### Top risks and mitigations
-
-| Risk | Why it matters | Mitigation |
-|---|---|---|
-| Non-JSON responses or partial JSON | Breaks deterministic orchestration | Enforce “JSON only” prompts; use `-s`; add extraction/repair heuristic; implement bounded retry. citeturn3view1turn3view0 |
-| Unsafe diffs (path traversal, unexpected file edits) | Security + repo integrity | Parse diff headers and reject absolute/`..` paths; optionally restrict to target file(s). |
-| Dangerous shell commands | Skills may request execution | Keep runner command allowlist; deny by default; in Copilot CLI, continue denying tools with `--deny-tool`. citeturn5view3turn5view4 |
-| Environment variability (tools installed, test commands differ) | Prototype may fail on some repos | Sidecar config `.copi-runner.json` for `test_cmd`; fallback to simple checks (e.g., `python -m compileall`). |
-| Compatibility drift across ecosystems | Claude/Copilot docs evolve | Keep protocol stable; isolate prompt templates; add a small regression suite. |
-
-### Optional: Spec Kit integration (recommended for validation)
-
-If you use Spec Kit, treat “Claude skill runner compatibility” as a spec with acceptance tests. GitHub positions Spec Kit as a toolkit for spec-driven development that works across agent workflows (including Copilot). citeturn0search7turn0search3turn0search22  
-For a lightweight runner, the most valuable Spec Kit output is a small suite of fixtures:
-- skill parsing tests (frontmatter + substitutions),
-- patch application tests,
-- and 2–3 end-to-end skills that run in a temp repo.
-
-## Prioritized sources to consult
-
-1. GitHub Copilot CLI programmatic usage (`-p`, `-s`, CI examples). citeturn3view0turn3view1  
-2. GitHub Copilot CLI command reference (tool allow/deny, output formats, `--no-custom-instructions`, `--no-ask-user`). citeturn5view3turn5view0turn5view2  
-3. GitHub: Creating agent skills for Copilot CLI (skill directory locations; `SKILL.md` structure). citeturn3view2  
-4. Claude Code skills documentation (frontmatter fields, substitutions, `!`command preprocessing, tool restriction). citeturn4view1turn4view4  
-5. GitHub Spec Kit repo + documentation (spec-driven workflow framing). citeturn0search3turn0search22turn0search7
+This uses:
+- `vscode.lm.selectChatModels({ vendor: 'copilot', family: 'gpt-4o' })` and handles “no models” cases citeturn8view0turn3view2  
+- `model.sendRequest(...)` and streaming `resp.text` citeturn3view0turn8view0  
+- A JSON-only instruction message, consistent with LM API examples that instruct “respond just with code / do not use markdown.” citeturn8view0turn3view0
